@@ -22,15 +22,18 @@ pub struct RedisManager {
 }
 
 impl RedisManager {
-    pub async fn new(config: RedisConfig) -> Result<Self, RedisError> {
+    pub async fn new(config: &RedisConfig) -> Result<Self, RedisError> {
         let client = Client::open(config.connection_url())?;
         let connection = client.get_multiplexed_async_connection().await?;
         info!(url = %config.connection_url(), "Redis连接成功");
 
-        Ok(Self { config, connection })
+        Ok(Self {
+            config: config.clone(),
+            connection,
+        })
     }
 
-    pub async fn publish_retweet(&mut self, message: &RetweetMessage) -> Result<(), RedisError> {
+    pub async fn publish_retweet(&self, message: &RetweetMessage) -> Result<(), RedisError> {
         let json = serde_json::to_string(message).unwrap_or_else(|e| {
             error!(error = %e, "序列化转发消息失败");
             format!("{{\"content\":\"{}\"}}", message.content)
@@ -40,7 +43,7 @@ impl RedisManager {
         let result: Value = redis::cmd("PUBLISH")
             .arg(channel)
             .arg(&json)
-            .query_async(&mut self.connection)
+            .query_async(&mut self.connection.clone())
             .await?;
 
         match result {
