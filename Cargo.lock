@@ -887,6 +887,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1064,8 +1065,8 @@ dependencies = [
 
 [[package]]
 name = "qq-bot"
-version = "0.2.0"
-source = "git+https://github.com/NullOnSpace/silly-wx78.git#e4ee9688942f78e189fef42fe56741c06ef90bb8"
+version = "0.5.0"
+source = "git+ssh://git@github.com/NullOnSpace/silly-wx78.git#14ac109f070063a845141b1124cea1b32521ad6f"
 dependencies = [
  "clap",
  "dotenvy",
@@ -1077,6 +1078,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1634,6 +1636,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

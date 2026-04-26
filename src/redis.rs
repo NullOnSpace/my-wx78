@@ -17,8 +17,8 @@ pub struct RetweetMessage {
 }
 
 pub struct RedisManager {
-    config: RedisConfig,
     connection: MultiplexedConnection,
+    retweet_channel: String,
 }
 
 impl RedisManager {
@@ -28,8 +28,8 @@ impl RedisManager {
         info!(url = %config.connection_url(), "Redis连接成功");
 
         Ok(Self {
-            config: config.clone(),
             connection,
+            retweet_channel: config.retweet_channel.clone(),
         })
     }
 
@@ -39,7 +39,7 @@ impl RedisManager {
             format!("{{\"content\":\"{}\"}}", message.content)
         });
 
-        let channel = &self.config.retweet_channel;
+        let channel = &self.retweet_channel;
         let result: Value = redis::cmd("PUBLISH")
             .arg(channel)
             .arg(&json)
@@ -60,9 +60,10 @@ impl RedisManager {
 
     pub async fn subscribe_source_channels(
         &self,
+        config: &RedisConfig,
         handler: impl Fn(String, String) + Send + 'static,
     ) -> Result<(), RedisError> {
-        let channels = &self.config.source_channels;
+        let channels = &config.source_channels;
         if channels.is_empty() {
             warn!("没有配置订阅频道，跳过订阅");
             return Ok(());
@@ -70,7 +71,7 @@ impl RedisManager {
 
         info!(channels = ?channels, "开始订阅Redis频道");
 
-        let client = Client::open(self.config.connection_url())?;
+        let client = Client::open(config.connection_url())?;
         let mut pubsub_conn = client.get_async_pubsub().await?;
 
         for channel in channels {
