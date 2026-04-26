@@ -29,11 +29,11 @@ impl WebSocketHandler for RetweetHandler {
             let openid = message
                 .author
                 .user_openid
-                .clone()
-                .unwrap_or_else(|| message.author.id.clone());
+                .as_deref()
+                .unwrap_or(&message.author.id);
 
             match self.dm_client
-                .reply_message(&openid, message.id.clone(), "收到".to_string(), None)
+                .reply_message(openid, message.id.clone(), "收到".to_string(), None)
                 .await
             {
                 Ok(response) => {

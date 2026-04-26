@@ -17,29 +17,33 @@ pub struct RetweetMessage {
 }
 
 pub struct RedisManager {
+    config: RedisConfig,
     connection: MultiplexedConnection,
-    retweet_channel: String,
 }
 
 impl RedisManager {
     pub async fn new(config: &RedisConfig) -> Result<Self, RedisError> {
-        let client = Client::open(config.connection_url())?;
-        let connection = client.get_multiplexed_async_connection().await?;
-        info!(url = %config.connection_url(), "Redis连接成功");
-
+        let connection = Self::create_connection(&config).await?;
         Ok(Self {
+            config: config.clone(),
             connection,
-            retweet_channel: config.retweet_channel.clone(),
         })
     }
 
-    pub async fn publish_retweet(&self, message: &RetweetMessage) -> Result<(), RedisError> {
-        let json = serde_json::to_string(message).unwrap_or_else(|e| {
-            error!(error = %e, "序列化转发消息失败");
-            format!("{{\"content\":\"{}\"}}", message.content)
-        });
+    async fn create_connection(config: &RedisConfig) -> Result<MultiplexedConnection, RedisError> {
+        let client = Client::open(config.connection_url())?;
+        let connection = client.get_multiplexed_async_connection().await?;
+        info!(url = %config.connection_url(), "Redis连接成功");
+        Ok(connection)
+    }
 
-        let channel = &self.retweet_channel;
+    pub async fn publish_retweet(&self, message: &RetweetMessage) -> Result<(), RedisError> {
+        let json = serde_json::to_string(message).map_err(|e| {
+            error!(error = %e, "序列化转发消息失败");
+            RedisError::from((ErrorKind::Client, "序列化转发消息失败"))
+        })?;
+
+        let channel = &self.config.retweet_channel;
         let result: Value = redis::cmd("PUBLISH")
             .arg(channel)
             .arg(&json)

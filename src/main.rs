@@ -33,7 +33,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    dotenvy::dotenv()?;
+    dotenvy::dotenv().ok();
 
     let app_config = AppConfig::from_env()?;
     let redis_config = app_config.redis;
@@ -53,6 +53,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cancellation_token = CancellationToken::new();
 
+    let ctrl_c_token = cancellation_token.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("收到Ctrl+C信号，开始优雅关闭");
+        ctrl_c_token.cancel();
+    });
+
     let ws_task = tokio::spawn(start_websocket(
         Arc::clone(&auth_client),
         Arc::clone(&http_client),
@@ -65,7 +72,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         redis_config,
         Arc::clone(&redis),
         Arc::clone(&dm_client),
-        Arc::new(qq_bot_config.open_id),
+        qq_bot_config.open_id.into(),
         cancellation_token.clone(),
     ));
 
@@ -108,7 +115,7 @@ async fn start_redis_subscriber(
     redis_config: config::RedisConfig,
     redis: Arc<RedisManager>,
     dm_client: Arc<DirectMessageClient>,
-    open_id: Arc<String>,
+    open_id: Arc<str>,
     cancellation_token: CancellationToken,
 ) -> Result<(), redis::RedisError> {
     info!("启动Redis订阅，监听外部消息");
