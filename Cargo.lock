@@ -1066,7 +1066,7 @@ dependencies = [
 [[package]]
 name = "qq-bot"
 version = "0.5.0"
-source = "git+ssh://git@github.com/NullOnSpace/silly-wx78.git#14ac109f070063a845141b1124cea1b32521ad6f"
+source = "git+https://github.com/NullOnSpace/silly-wx78.git#14ac109f070063a845141b1124cea1b32521ad6f"
 dependencies = [
  "clap",
  "dotenvy",
