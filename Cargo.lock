@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "my-wx78"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dotenvy",
  "futures-util",
@@ -1065,7 +1065,7 @@ dependencies = [
 [[package]]
 name = "qq-bot"
 version = "0.2.0"
-source = "git+ssh://git@github.com/NullOnSpace/silly-wx78.git#e4ee9688942f78e189fef42fe56741c06ef90bb8"
+source = "git+https://github.com/NullOnSpace/silly-wx78.git#e4ee9688942f78e189fef42fe56741c06ef90bb8"
 dependencies = [
  "clap",
  "dotenvy",
