@@ -1,20 +1,21 @@
 mod config;
 mod handler;
+mod outbound;
 mod redis;
 
+use anyhow::Context;
 use config::AppConfig;
 use handler::RetweetHandler;
-use qq_bot::{AuthClient, AuthConfig, CancellationToken, DirectMessageClient, WebSocketClient, WebSocketConfig};
+use qq_bot::{AuthClient, AuthConfig, DirectMessageClient, WebSocketClient, WebSocketConfig};
 use redis::RedisManager;
 use reqwest::Client;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const MAX_REDIS_BACKOFF_SECS: u64 = 30;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(1024 * 1024)
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async_main())
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,31 +37,28 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let app_config = AppConfig::from_env()?;
-    let redis_config = app_config.redis;
-    let qq_bot_config = app_config.qq_bot;
 
     let http_client = Arc::new(Client::new());
 
     let auth_config = AuthConfig {
-        app_id: qq_bot_config.app_id.into(),
-        client_secret: qq_bot_config.client_secret.into(),
+        app_id: app_config.qq_bot.app_id.clone().into(),
+        client_secret: app_config.qq_bot.client_secret.clone().into(),
     };
     let auth_client = Arc::new(AuthClient::new(auth_config, Arc::clone(&http_client)));
 
-    let dm_client = Arc::new(DirectMessageClient::new(Arc::clone(&http_client), Arc::clone(&auth_client)));
+    let dm_client = Arc::new(DirectMessageClient::new(
+        Arc::clone(&http_client),
+        Arc::clone(&auth_client),
+    ));
 
-    let redis = Arc::new(RedisManager::new(&redis_config).await?);
+    let redis = Arc::new(RedisManager::new(&app_config.redis).await?);
 
     let cancellation_token = CancellationToken::new();
 
-    let ctrl_c_token = cancellation_token.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("收到Ctrl+C信号，开始优雅关闭");
-        ctrl_c_token.cancel();
-    });
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
-    let ws_task = tokio::spawn(start_websocket(
+    // 任务 1：入向链（QQ WS → RetweetHandler → qqbot-retweet + 回复"收到"）。
+    tasks.spawn(start_websocket(
         Arc::clone(&auth_client),
         Arc::clone(&http_client),
         Arc::clone(&redis),
@@ -68,32 +66,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cancellation_token.clone(),
     ));
 
-    let redis_task = tokio::spawn(start_redis_subscriber(
-        redis_config,
-        Arc::clone(&redis),
+    // 任务 2：出向链（rendered.qq → QQ 发送 → receipts）。
+    tasks.spawn(outbound::run_outbound(
+        app_config.clone(),
         Arc::clone(&dm_client),
-        qq_bot_config.open_id.into(),
         cancellation_token.clone(),
     ));
 
-    tokio::select! {
-        result = ws_task => {
-            match result {
-                Ok(Ok(())) => info!("WebSocket任务正常结束"),
-                Ok(Err(e)) => error!(error = %e, "WebSocket任务异常结束"),
-                Err(e) => error!(error = %e, "WebSocket任务panic"),
-            }
-        }
-        result = redis_task => {
-            match result {
-                Ok(Ok(())) => info!("Redis订阅任务正常结束"),
-                Ok(Err(e)) => error!(error = %e, "Redis订阅任务异常结束"),
-                Err(e) => error!(error = %e, "Redis订阅任务panic"),
-            }
+    shutdown_signal().await?;
+    info!("收到关机信号，开始优雅关闭");
+    cancellation_token.cancel();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(error = %e, "任务异常结束"),
+            Err(e) => error!(error = %e, "任务panic或被中止"),
         }
     }
 
-    cancellation_token.cancel();
     Ok(())
 }
 
@@ -103,69 +93,36 @@ async fn start_websocket(
     redis: Arc<RedisManager>,
     dm_client: Arc<DirectMessageClient>,
     cancellation_token: CancellationToken,
-) -> Result<(), qq_bot::WebSocketError> {
+) -> anyhow::Result<()> {
     info!("启动WebSocket连接，监听QQ消息");
     let handler = Arc::new(RetweetHandler::new(redis, dm_client));
     let ws_config = WebSocketConfig::new(2113934851);
     let ws_client = Arc::new(WebSocketClient::new(auth_client, ws_config, http_client));
-    ws_client.run(handler, cancellation_token).await
+    ws_client
+        .run(handler, cancellation_token)
+        .await
+        .context("WebSocket任务异常结束")
 }
 
-async fn start_redis_subscriber(
-    redis_config: config::RedisConfig,
-    redis: Arc<RedisManager>,
-    dm_client: Arc<DirectMessageClient>,
-    open_id: Arc<str>,
-    cancellation_token: CancellationToken,
-) -> Result<(), redis::RedisError> {
-    info!("启动Redis订阅，监听外部消息");
-    let mut backoff_secs: u64 = 1;
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| anyhow::anyhow!("ctrl_c handler failed: {error}"))
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| anyhow::anyhow!("SIGTERM handler install failed: {error}"))?;
+        sigterm.recv().await;
+        Ok::<(), anyhow::Error>(())
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-    loop {
-        let result = redis
-            .subscribe_source_channels(
-                &redis_config,
-                {
-                    let dm_client = Arc::clone(&dm_client);
-                    let open_id = Arc::clone(&open_id);
-                    move |_channel, payload| {
-                        let dm_client = Arc::clone(&dm_client);
-                        let open_id = Arc::clone(&open_id);
-                        tokio::spawn(async move {
-                            info!(payload_len = payload.len(), "从Redis收到消息，准备发送给QQ用户");
-                            match dm_client.send_text(&open_id, payload).await {
-                                Ok(response) => {
-                                    info!(message_id = %response.id, "消息发送给QQ用户成功");
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "消息发送给QQ用户失败");
-                                }
-                            }
-                        });
-                    }
-                },
-            )
-            .await;
-
-        match result {
-            Ok(()) => {
-                info!("Redis订阅正常断开，准备重连");
-                backoff_secs = 1;
-            }
-            Err(e) => {
-                error!(error = %e, "Redis订阅异常断开");
-                backoff_secs = (backoff_secs * 2).min(MAX_REDIS_BACKOFF_SECS);
-            }
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
-                info!(backoff_secs, "等待后重连Redis订阅");
-            }
-            _ = cancellation_token.cancelled() => {
-                info!("收到关机信号，停止Redis订阅重连");
-                return Ok(());
-            }
-        }
+    tokio::select! {
+        result = ctrl_c => { result? }
+        result = terminate => { result? }
     }
+    Ok(())
 }

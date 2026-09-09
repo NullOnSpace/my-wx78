@@ -17,7 +17,11 @@ impl RetweetHandler {
 }
 
 impl WebSocketHandler for RetweetHandler {
-    fn on_message(&self, message: MessageEvent, _client: Arc<WebSocketClient>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn on_message(
+        &self,
+        message: MessageEvent,
+        _client: Arc<WebSocketClient>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             info!(
                 message_id = %message.id,
@@ -32,7 +36,8 @@ impl WebSocketHandler for RetweetHandler {
                 .as_deref()
                 .unwrap_or(&message.author.id);
 
-            match self.dm_client
+            match self
+                .dm_client
                 .reply_message(openid, message.id.clone(), "收到".to_string(), None)
                 .await
             {

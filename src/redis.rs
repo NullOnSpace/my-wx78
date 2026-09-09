@@ -1,12 +1,12 @@
 pub use redis::RedisError;
 
 use crate::config::RedisConfig;
-use futures_util::StreamExt;
 use redis::aio::MultiplexedConnection;
 use redis::{Client, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
+/// 入向消息（QQ WS → Redis `qqbot-retweet`）。Phase 5 才 canonical 化。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RetweetMessage {
     pub message_id: String,
@@ -23,7 +23,7 @@ pub struct RedisManager {
 
 impl RedisManager {
     pub async fn new(config: &RedisConfig) -> Result<Self, RedisError> {
-        let connection = Self::create_connection(&config).await?;
+        let connection = Self::create_connection(config).await?;
         Ok(Self {
             config: config.clone(),
             connection,
@@ -60,44 +60,5 @@ impl RedisManager {
                 "PUBLISH返回非整数结果",
             ))),
         }
-    }
-
-    pub async fn subscribe_source_channels(
-        &self,
-        config: &RedisConfig,
-        handler: impl Fn(String, String) + Send + 'static,
-    ) -> Result<(), RedisError> {
-        let channels = &config.source_channels;
-        if channels.is_empty() {
-            warn!("没有配置订阅频道，跳过订阅");
-            return Ok(());
-        }
-
-        info!(channels = ?channels, "开始订阅Redis频道");
-
-        let client = Client::open(config.connection_url())?;
-        let mut pubsub_conn = client.get_async_pubsub().await?;
-
-        for channel in channels {
-            pubsub_conn.subscribe(channel).await?;
-            info!(channel = %channel, "已订阅频道");
-        }
-
-        let mut msg_stream = pubsub_conn.on_message();
-
-        while let Some(msg) = msg_stream.next().await {
-            let channel_name = msg.get_channel_name().to_string();
-            let payload: String = msg.get_payload().unwrap_or_else(|e| {
-                error!(error = %e, channel = %channel_name, "解析消息payload失败");
-                String::new()
-            });
-            if !payload.is_empty() {
-                info!(channel = %channel_name, payload_len = payload.len(), "收到订阅消息");
-                handler(channel_name, payload);
-            }
-        }
-
-        warn!("订阅连接断开");
-        Ok(())
     }
 }
