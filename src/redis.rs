@@ -1,9 +1,9 @@
 pub use redis::RedisError;
 
-use canonical_msg::prost::Message;
 use canonical_msg::CanonicalMessage;
-use redis::aio::MultiplexedConnection;
+use canonical_msg::prost::Message;
 use redis::Client;
+use redis::aio::MultiplexedConnection;
 use streams_lib::xadd_message;
 use tracing::{error, info};
 
@@ -25,7 +25,7 @@ impl RedisManager {
 
     async fn create_connection(config: &RedisConfig) -> Result<MultiplexedConnection, RedisError> {
         let client = Client::open(config.connection_url())?;
-        let connection = client.get_multiplexed_tokio_connection().await?;
+        let connection = client.get_multiplexed_async_connection().await?;
         info!(url = %config.connection_url(), "Redis连接成功");
         Ok(connection)
     }
@@ -34,12 +34,16 @@ impl RedisManager {
     ///
     /// 语义与 pub/sub PUBLISH 对齐（fire-and-forget，XADD 成功即认为已投）；
     /// 可靠投递由 push-core 消费侧 consumer group pending 兜底。
-    pub async fn publish_canonical_chat(&self, message: &CanonicalMessage) -> Result<(), RedisError> {
+    pub async fn publish_canonical_chat(
+        &self,
+        message: &CanonicalMessage,
+    ) -> Result<(), RedisError> {
         let bytes = message.encode_to_vec();
         let stream = &self.config.msgs_stream;
 
-        let id = xadd_message(&mut self.connection.clone(), stream, &bytes).await.map_err(
-            |e| {
+        let id = xadd_message(&mut self.connection.clone(), stream, &bytes)
+            .await
+            .map_err(|e| {
                 error!(
                     error = %e,
                     stream = %stream,
@@ -47,8 +51,7 @@ impl RedisManager {
                     "XADD canonical chat 失败"
                 );
                 e
-            },
-        )?;
+            })?;
 
         info!(
             stream = %stream,
@@ -70,8 +73,8 @@ mod tests {
     use canonical_msg::canonical_message;
     use canonical_msg::{MsgKind, SourceKind};
     use qq_bot::{MessageAuthor, MessageEvent};
-    use redis::streams::StreamRangeReply;
     use redis::AsyncCommands;
+    use redis::streams::StreamRangeReply;
 
     fn fake_event() -> MessageEvent {
         MessageEvent {
@@ -102,9 +105,13 @@ mod tests {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
         let stream = "my-wx78-test-msgs-in";
         let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_multiplexed_tokio_connection().await.unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
         // 清理测试残留，保证 XRANGE 只有本测试的一条。
-        redis::cmd("DEL").arg(stream).query_async::<i64>(&mut conn).await.unwrap();
+        redis::cmd("DEL")
+            .arg(stream)
+            .query_async::<i64>(&mut conn)
+            .await
+            .unwrap();
 
         let config = RedisConfig {
             url,

@@ -33,11 +33,12 @@ impl RetweetHandler {
     /// - 顶层 `published_at` = `domain.chat.received_at` 同值（内容发布时间 = 消息到达入向时刻）；
     /// - `chat_id` 留空（QQ C2C 无群概念，会话身份在 `author_openid`）。
     pub fn build_canonical_chat(message: &MessageEvent) -> CanonicalMessage {
-        let received_at = parse_platform_timestamp(&message.timestamp).unwrap_or_else(now_timestamp);
+        let received_at =
+            parse_platform_timestamp(&message.timestamp).unwrap_or_else(now_timestamp);
         let content = message.content.clone();
 
         CanonicalMessage {
-            id: ulid::Ulid::new().to_string(),
+            id: ulid::Ulid::generate().to_string(),
             source: Some(Source {
                 kind: SourceKind::Im as i32,
                 id: SOURCE_ID.to_owned(),
@@ -267,7 +268,11 @@ mod tests {
             canonical_message::Domain::Chat(chat) => chat,
             _ => panic!("expected chat domain"),
         };
-        assert_eq!(chat.received_at, Some(ts), "published_at 与 received_at 同值");
+        assert_eq!(
+            chat.received_at,
+            Some(ts),
+            "published_at 与 received_at 同值"
+        );
     }
 
     #[test]
@@ -276,7 +281,12 @@ mod tests {
         let msg = RetweetHandler::build_canonical_chat(&event);
         assert_eq!(msg.published_at.unwrap().seconds, 1_787_743_543);
 
-        let event = fake_event("pm-0004", author_with_openid("o-1004"), "hi", "1787743543123");
+        let event = fake_event(
+            "pm-0004",
+            author_with_openid("o-1004"),
+            "hi",
+            "1787743543123",
+        );
         let msg = RetweetHandler::build_canonical_chat(&event);
         let ts = msg.published_at.unwrap();
         assert_eq!((ts.seconds, ts.nanos), (1_787_743_543, 123_000_000));

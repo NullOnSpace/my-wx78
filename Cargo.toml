@@ -11,11 +11,11 @@ dispatch-core = { path = "../push-architecture/dispatch-core" }
 streams-lib = { path = "../push-architecture/streams-lib" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-redis = { version = "0.29", features = ["tokio-comp"] }
+redis = { version = "1.7", features = ["tokio-comp"] }
 dotenvy = "0.15"
 anyhow = "1"
 serde_json = "1"
-ulid = "1"
+ulid = "3"
 jiff = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

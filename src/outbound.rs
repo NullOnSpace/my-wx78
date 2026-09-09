@@ -283,7 +283,7 @@ async fn run_outbound_loop<S: QqSender + 'static>(
     } = *channels;
     let client = redis::Client::open(redis_url)?;
     let publish_conn = client
-        .get_multiplexed_tokio_connection()
+        .get_multiplexed_async_connection()
         .await
         .context("connecting redis for receipts publishing")?;
     let cfg = ConsumerConfig::new(rendered_stream, OUTBOUND_GROUP);
@@ -782,10 +782,14 @@ mod tests {
         let receipts_stream = "my-wx78-test-receipts";
         let dlq_stream = format!("{rendered_stream}:dlq");
         let client = redis::Client::open(redis_url.as_str()).unwrap();
-        let mut admin = client.get_multiplexed_tokio_connection().await.unwrap();
+        let mut admin = client.get_multiplexed_async_connection().await.unwrap();
         // 清理测试残留（DEL 连 consumer group 一并删除，测试自建全新组）。
         for key in [rendered_stream, receipts_stream, dlq_stream.as_str()] {
-            redis::cmd("DEL").arg(key).query_async::<i64>(&mut admin).await.unwrap();
+            redis::cmd("DEL")
+                .arg(key)
+                .query_async::<i64>(&mut admin)
+                .await
+                .unwrap();
         }
 
         let cancel = CancellationToken::new();
@@ -828,8 +832,7 @@ mod tests {
             .await
             .unwrap();
 
-        let receipt =
-            wait_for_receipt(&mut admin, receipts_stream, Duration::from_secs(10)).await;
+        let receipt = wait_for_receipt(&mut admin, receipts_stream, Duration::from_secs(10)).await;
         assert_eq!(receipt.task_id, "task-1");
         assert_eq!(receipt.channel, Channel::Qq as i32);
         assert_eq!(receipt.target_id, "openid_test");
@@ -897,10 +900,7 @@ mod tests {
                     return receipt;
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "receipt not published in time"
-            );
+            assert!(Instant::now() < deadline, "receipt not published in time");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
