@@ -20,9 +20,12 @@ pub struct QqBotConfig {
 #[derive(Clone)]
 pub struct RedisConfig {
     pub url: String,
-    pub retweet_channel: String,
-    pub rendered_channel: String,
-    pub receipts_channel: String,
+    /// 入向 canonical CHAT 的 XADD 目标 stream（`stream:msgs:in`，push-core 消费）。
+    pub msgs_stream: String,
+    /// 出向消费的渲染信封 stream（`stream:rendered:qq`，render-hub C 层产出）。
+    pub rendered_stream: String,
+    /// 发送回执的 XADD 目标 stream（`stream:receipts`，push-core 消费）。
+    pub receipts_stream: String,
 }
 
 #[derive(Clone)]
@@ -44,9 +47,9 @@ impl AppConfig {
         info!(
             app_id = %qq_bot.app_id,
             redis_url = %redis.url,
-            retweet_channel = %redis.retweet_channel,
-            rendered_channel = %redis.rendered_channel,
-            receipts_channel = %redis.receipts_channel,
+            msgs_stream = %redis.msgs_stream,
+            rendered_stream = %redis.rendered_stream,
+            receipts_stream = %redis.receipts_stream,
             rate_limit_per_min = outbound.rate_limit_per_min,
             retry_max_attempts = outbound.retry_max_attempts,
             "成功加载配置"
@@ -76,18 +79,18 @@ impl QqBotConfig {
 impl RedisConfig {
     fn from_env() -> Result<Self, env::VarError> {
         let url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-        let retweet_channel =
-            env::var("REDIS_RETWEET_CHANNEL").unwrap_or_else(|_| "qqbot_retweet".to_string());
-        let rendered_channel =
-            env::var("RENDERED_CHANNEL").unwrap_or_else(|_| "rendered.qq".to_string());
-        let receipts_channel =
-            env::var("RECEIPTS_CHANNEL").unwrap_or_else(|_| "receipts".to_string());
+        let msgs_stream =
+            env::var("REDIS_MSGS_STREAM").unwrap_or_else(|_| "stream:msgs:in".to_string());
+        let rendered_stream =
+            env::var("REDIS_RENDERED_STREAM").unwrap_or_else(|_| "stream:rendered:qq".to_string());
+        let receipts_stream =
+            env::var("REDIS_RECEIPTS_STREAM").unwrap_or_else(|_| "stream:receipts".to_string());
 
         Ok(Self {
             url,
-            retweet_channel,
-            rendered_channel,
-            receipts_channel,
+            msgs_stream,
+            rendered_stream,
+            receipts_stream,
         })
     }
 

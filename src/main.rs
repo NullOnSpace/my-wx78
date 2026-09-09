@@ -57,7 +57,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
-    // 任务 1：入向链（QQ WS → RetweetHandler → qqbot-retweet + 回复"收到"）。
+    // 任务 1：入向链（QQ WS → RetweetHandler → canonical CHAT XADD stream:msgs:in + 回复"收到"）。
     tasks.spawn(start_websocket(
         Arc::clone(&auth_client),
         Arc::clone(&http_client),
@@ -66,7 +66,7 @@ async fn async_main() -> anyhow::Result<()> {
         cancellation_token.clone(),
     ));
 
-    // 任务 2：出向链（rendered.qq → QQ 发送 → receipts）。
+    // 任务 2：出向链（stream:rendered:qq 消费 → QQ 发送 → receipts XADD stream:receipts）。
     tasks.spawn(outbound::run_outbound(
         app_config.clone(),
         Arc::clone(&dm_client),

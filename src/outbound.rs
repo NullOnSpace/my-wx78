@@ -1,8 +1,9 @@
 //! 出向管线：纯 D 连接器（push.v1 契约）。
 //!
-//! 订阅 `rendered.qq`（render-hub C 层产出 proto 编码的 [`RenderEnvelope`]），
-//! 按 payload 链序尝试（主 payload + 预渲染 fallback，成功即停），
-//! 每个信封的发送结果发布一条 [`SendReceipt`] 到 `receipts`。
+//! 消费 `stream:rendered:qq`（streams-lib consumer group `my-wx78`；render-hub C 层
+//! 产出 proto 编码的 [`RenderEnvelope`]），按 payload 链序尝试（主 payload + 预渲染
+//! fallback，成功即停），每个信封的发送结果 XADD 一条 [`SendReceipt`] 到
+//! `stream:receipts`。
 //!
 //! 本连接器不理解消息语义（不变量 #4）：只把 envelope 身份字段原样拷贝进
 //! receipt，除声明的 [`PayloadKind`] 外不解释 payload 内容。
@@ -13,9 +14,9 @@ use std::time::Duration;
 use anyhow::Context;
 use canonical_msg::prost::Message;
 use canonical_msg::{Channel, PayloadKind, RenderEnvelope, SendReceipt};
-use futures_util::StreamExt;
 use qq_bot::{DirectMessageClient, DirectMessageError};
-use redis::aio::{MultiplexedConnection, PubSub};
+use redis::aio::MultiplexedConnection;
+use streams_lib::{ConsumerConfig, DATA_FIELD, consume_loop, xadd_message};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
@@ -25,6 +26,9 @@ use dispatch_core::{
 
 /// Redis 订阅异常后的重连退避上界。
 const MAX_REDIS_BACKOFF_SECS: u64 = 30;
+
+/// 出向 consumer group 名（组名=服务名，streams-lib 约定）。
+const OUTBOUND_GROUP: &str = "my-wx78";
 
 /// 发送原语抽象（仿 feishu-bot `CardSender`）：payload 链逻辑用手写 mock
 /// 测试，真实实现包 `DirectMessageClient`。返回平台的 message id
@@ -229,19 +233,14 @@ async fn dispatch_envelope<S: QqSender>(
     })
 }
 
-/// 发布 receipt；发布失败只损失一次可观测性，绝不能拖垮/中断消息循环。
+/// XADD 一条 receipt；失败只损失一次可观测性，绝不能拖垮/中断消息循环。
 async fn publish_receipt(
     conn: &mut MultiplexedConnection,
-    receipts_channel: &str,
+    receipts_stream: &str,
     receipt: &SendReceipt,
 ) {
     let bytes = receipt.encode_to_vec();
-    if let Err(error) = redis::cmd("PUBLISH")
-        .arg(receipts_channel)
-        .arg(&bytes)
-        .query_async::<i64>(conn)
-        .await
-    {
+    if let Err(error) = xadd_message(conn, receipts_stream, &bytes).await {
         tracing::warn!(
             task_id = %receipt.task_id,
             %error,
@@ -250,127 +249,135 @@ async fn publish_receipt(
     }
 }
 
-/// 消费 rendered 频道直至取消：decode → validate → 限流/重试发送 → receipt。
+/// 消费 rendered stream 直至取消：decode → validate → 限流/重试发送 → receipt。
+///
+/// 传输走 streams-lib [`consume_loop`]（group=`my-wx78`）：handler Ok = XACK；
+/// handler Err = 留在 pending 待 XAUTOCLAIM 接管重试，超限进 DLQ。
+///
+/// `sender`/`bucket`/`policy` 以 `Arc` 传入：consume_loop 要求 handler 返回的
+/// future 为 `'static`（类型参数默认带 `'static` 界），闭包只能捕获 owned 数据。
 ///
 /// # Errors
-/// Redis 连接/订阅错误时返回 Err（由外层 [`run_outbound`] 退避重连）；
+/// Redis 连接错误时返回 Err（由外层 [`run_outbound`] 退避重连）；
 /// 入向管线独立于本任务，不受影响。
 struct LoopChannels<'a> {
     redis_url: &'a str,
-    rendered_channel: &'a str,
-    receipts_channel: &'a str,
+    rendered_stream: &'a str,
+    receipts_stream: &'a str,
     /// 入向回复兜底 openid（仅用于 target 不一致的 WARN 观测）。
     open_id: &'a str,
 }
 
-async fn run_outbound_loop<S: QqSender>(
+async fn run_outbound_loop<S: QqSender + 'static>(
     channels: &LoopChannels<'_>,
-    sender: &S,
-    bucket: &TokenBucket,
-    policy: &RetryPolicy,
+    sender: Arc<S>,
+    bucket: Arc<TokenBucket>,
+    policy: Arc<RetryPolicy>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let LoopChannels {
         redis_url,
-        rendered_channel,
-        receipts_channel,
+        rendered_stream,
+        receipts_stream,
         open_id,
     } = *channels;
     let client = redis::Client::open(redis_url)?;
-    let mut pubsub: PubSub = client
-        .get_async_pubsub()
-        .await
-        .context("connecting redis pub/sub")?;
-    pubsub
-        .subscribe(rendered_channel)
-        .await
-        .with_context(|| format!("subscribing {rendered_channel}"))?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
+    let publish_conn = client
+        .get_multiplexed_tokio_connection()
         .await
         .context("connecting redis for receipts publishing")?;
-    tracing::info!(channel = %rendered_channel, "redis subscribed");
+    let cfg = ConsumerConfig::new(rendered_stream, OUTBOUND_GROUP);
+    let loop_cancel = cancel.clone();
 
-    let mut stream = pubsub.on_message();
-    loop {
-        let message = tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            message = stream.next() => match message {
-                Some(message) => message,
-                None => anyhow::bail!("redis message stream ended unexpectedly"),
-            },
-        };
-
-        let raw: Vec<u8> = match message.get_payload() {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(%error, channel = %rendered_channel, "skipping undecodable payload");
-                continue;
+    consume_loop(client, cfg, cancel, move |entry| {
+        let mut publish_conn = publish_conn.clone();
+        let sender = Arc::clone(&sender);
+        let bucket = Arc::clone(&bucket);
+        let policy = Arc::clone(&policy);
+        let loop_cancel = loop_cancel.clone();
+        let rendered_stream = rendered_stream.to_owned();
+        let receipts_stream = receipts_stream.to_owned();
+        let open_id = open_id.to_owned();
+        async move {
+            let raw: Vec<u8> = entry
+                .get(DATA_FIELD)
+                .ok_or_else(|| anyhow::anyhow!("entry {} missing data field", entry.id))?;
+            let envelope = match RenderEnvelope::decode(raw.as_slice()) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    // 毒丸（C 层 bug/契约漂移）：留 pending 重试，超限进 DLQ。
+                    return Err(anyhow::anyhow!(
+                        "undecodable envelope on {rendered_stream}: {error}"
+                    ));
+                }
+            };
+            if let Err(reason) = validate_envelope(&envelope) {
+                tracing::warn!(
+                    task_id = %envelope.task_id,
+                    reason,
+                    "rejecting envelope"
+                );
+                // 契约违规 = 消费掉（XACK）但无 receipt：为它回执会误导 B。
+                return Ok(());
             }
-        };
-        let envelope = match RenderEnvelope::decode(raw.as_slice()) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                tracing::warn!(%error, channel = %rendered_channel, "skipping non-proto payload");
-                continue;
+
+            // target 语义：`RenderEnvelope.target_id` 是投递目标的唯一决策者
+            //（B 决策，不变量 #7），原样使用。env 的 `QQ_OPEN_ID` 不是出向目标：
+            // 它只是入向回复的兜底 openid（入向事件缺 user_openid 时用）。真实
+            // openid 只能从入向消息拿到，部署期出向收到的静态 openid 与 env 值
+            // 相同纯属巧合；两者不一致时 WARN 观测、仍按 envelope.target_id 发。
+            if envelope.target_id != open_id {
+                tracing::warn!(
+                    task_id = %envelope.task_id,
+                    envelope_target = %envelope.target_id,
+                    env_open_id = %open_id,
+                    "envelope target differs from QQ_OPEN_ID; sending to envelope.target_id (env value is inbound-reply fallback only)"
+                );
             }
-        };
-        if let Err(reason) = validate_envelope(&envelope) {
-            tracing::warn!(
-                task_id = %envelope.task_id,
-                reason,
-                "rejecting envelope"
-            );
-            continue;
-        }
 
-        // target 语义：`RenderEnvelope.target_id` 是投递目标的唯一决策者
-        //（B 决策，不变量 #7），原样使用。env 的 `QQ_OPEN_ID` 不是出向目标：
-        // 它只是入向回复的兜底 openid（入向事件缺 user_openid 时用）。真实
-        // openid 只能从入向消息拿到，部署期出向收到的静态 openid 与 env 值
-        // 相同纯属巧合；两者不一致时 WARN 观测、仍按 envelope.target_id 发。
-        if envelope.target_id != open_id {
-            tracing::warn!(
-                task_id = %envelope.task_id,
-                envelope_target = %envelope.target_id,
-                env_open_id = %open_id,
-                "envelope target differs from QQ_OPEN_ID; sending to envelope.target_id (env value is inbound-reply fallback only)"
-            );
+            let outcome = match dispatch_envelope(
+                sender.as_ref(),
+                &envelope,
+                &bucket,
+                &policy,
+                &loop_cancel,
+            )
+            .await
+            {
+                Some(outcome) => outcome,
+                None => {
+                    // 关机途中被外部放弃：Err → 不 XACK，留 pending 由下个实例补投。
+                    return Err(anyhow::anyhow!("dispatch cancelled during shutdown"));
+                }
+            };
+            if outcome.ok {
+                tracing::info!(
+                    task_id = %envelope.task_id,
+                    message_id = %envelope.message_id,
+                    target = %envelope.target_id,
+                    attempts = outcome.attempts,
+                    "sent"
+                );
+            } else {
+                tracing::error!(
+                    task_id = %envelope.task_id,
+                    message_id = %envelope.message_id,
+                    target = %envelope.target_id,
+                    attempts = outcome.attempts,
+                    error = outcome.error.as_deref().unwrap_or("?"),
+                    "all payloads failed"
+                );
+            }
+            publish_receipt(
+                &mut publish_conn,
+                &receipts_stream,
+                &build_receipt(&envelope, &outcome, outcome.platform_message_id.as_deref()),
+            )
+            .await;
+            Ok(())
         }
-
-        let Some(outcome) = dispatch_envelope(sender, &envelope, bucket, policy, &cancel).await
-        else {
-            tracing::info!(task_id = %envelope.task_id, "dispatch cancelled during shutdown");
-            break;
-        };
-        if outcome.ok {
-            tracing::info!(
-                task_id = %envelope.task_id,
-                message_id = %envelope.message_id,
-                target = %envelope.target_id,
-                attempts = outcome.attempts,
-                "sent"
-            );
-        } else {
-            tracing::error!(
-                task_id = %envelope.task_id,
-                message_id = %envelope.message_id,
-                target = %envelope.target_id,
-                attempts = outcome.attempts,
-                error = outcome.error.as_deref().unwrap_or("?"),
-                "all payloads failed"
-            );
-        }
-        publish_receipt(
-            &mut conn,
-            receipts_channel,
-            &build_receipt(&envelope, &outcome, outcome.platform_message_id.as_deref()),
-        )
-        .await;
-    }
-    tracing::info!("outbound connector stopped");
-    Ok(())
+    })
+    .await
 }
 
 /// 带重连的外出向循环：Redis 故障按指数退避重连，取消信号可打断等待。
@@ -381,24 +388,31 @@ pub async fn run_outbound(
 ) -> anyhow::Result<()> {
     // 突发容量与回填速率同值（30/min）：QQ 主动消息有月度配额与审核，
     // 瞬时突发不增加总配额消耗，只减少排队等待。
-    let bucket = TokenBucket::new(
+    let bucket = Arc::new(TokenBucket::new(
         config.outbound.rate_limit_per_min,
         f64::from(config.outbound.rate_limit_per_min),
-    );
-    let policy = RetryPolicy {
+    ));
+    let policy = Arc::new(RetryPolicy {
         max_attempts: config.outbound.retry_max_attempts,
         ..RetryPolicy::default()
-    };
+    });
 
     let mut backoff_secs: u64 = 1;
     loop {
         let channels = LoopChannels {
             redis_url: &config.redis.url,
-            rendered_channel: &config.redis.rendered_channel,
-            receipts_channel: &config.redis.receipts_channel,
+            rendered_stream: &config.redis.rendered_stream,
+            receipts_stream: &config.redis.receipts_stream,
             open_id: &config.qq_bot.open_id,
         };
-        match run_outbound_loop(&channels, sender.as_ref(), &bucket, &policy, cancel.clone()).await
+        match run_outbound_loop(
+            &channels,
+            Arc::clone(&sender),
+            Arc::clone(&bucket),
+            Arc::clone(&policy),
+            cancel.clone(),
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!("outbound loop stopped (shutdown)");
@@ -752,7 +766,7 @@ mod tests {
         assert_eq!(receipt.platform_message_id, "");
     }
 
-    /// 端到端（真实 Redis）：向 rendered 频道发布合法信封，receipts 频道必须
+    /// 端到端（真实 Redis）：向 rendered stream XADD 合法信封，receipts stream 必须
     /// 出现身份字段逐字回显的 receipt。mock 发送器证明"循环 + receipt 接线"
     /// 正确；真实 QQ 发送不进自动化测试（外部 SaaS，项目惯例）。
     /// env 门控：`MY_WX78_TEST_REDIS=1`。
@@ -764,12 +778,15 @@ mod tests {
         }
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        let rendered_stream = "my-wx78-test-rendered";
+        let receipts_stream = "my-wx78-test-receipts";
+        let dlq_stream = format!("{rendered_stream}:dlq");
         let client = redis::Client::open(redis_url.as_str()).unwrap();
-        let mut receipts_pubsub = client.get_async_pubsub().await.unwrap();
-        receipts_pubsub
-            .subscribe("my-wx78-test-receipts")
-            .await
-            .unwrap();
+        let mut admin = client.get_multiplexed_tokio_connection().await.unwrap();
+        // 清理测试残留（DEL 连 consumer group 一并删除，测试自建全新组）。
+        for key in [rendered_stream, receipts_stream, dlq_stream.as_str()] {
+            redis::cmd("DEL").arg(key).query_async::<i64>(&mut admin).await.unwrap();
+        }
 
         let cancel = CancellationToken::new();
         let loop_task = tokio::spawn({
@@ -778,25 +795,25 @@ mod tests {
             async move {
                 let channels = LoopChannels {
                     redis_url: &redis_url,
-                    rendered_channel: "my-wx78-test-rendered",
-                    receipts_channel: "my-wx78-test-receipts",
+                    rendered_stream,
+                    receipts_stream,
                     open_id: "openid_env",
                 };
                 run_outbound_loop(
                     &channels,
-                    &MarkdownFailsTextOkSender,
-                    &test_bucket(),
-                    &test_policy(),
+                    Arc::new(MarkdownFailsTextOkSender),
+                    Arc::new(test_bucket()),
+                    Arc::new(test_policy()),
                     cancel,
                 )
                 .await
             }
         });
 
-        // 等 loop 完成订阅：pub/sub 会丢掉订阅前发布的消息，立即发布会抖动。
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 等 consumer group 建好（XGROUP CREATE $ 之后 XADD 的消息才会被读到，
+        // 与 pub/sub 时代"等订阅完成"同理）。
+        wait_for_group(&mut admin, rendered_stream, OUTBOUND_GROUP).await;
 
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
         let envelope = envelope_with(
             Channel::Qq,
             "openid_test",
@@ -807,27 +824,12 @@ mod tests {
                 data: b"fallback text".to_vec(),
             }],
         );
-        redis::cmd("PUBLISH")
-            .arg("my-wx78-test-rendered")
-            .arg(envelope.encode_to_vec())
-            .query_async::<i64>(&mut conn)
+        xadd_message(&mut admin, rendered_stream, &envelope.encode_to_vec())
             .await
             .unwrap();
 
-        let mut receipt_stream = receipts_pubsub.on_message();
-        let receipt = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let Some(message) = receipt_stream.next().await else {
-                    continue;
-                };
-                let raw: Vec<u8> = message.get_payload().unwrap();
-                if let Ok(receipt) = SendReceipt::decode(raw.as_slice()) {
-                    break receipt;
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let receipt =
+            wait_for_receipt(&mut admin, receipts_stream, Duration::from_secs(10)).await;
         assert_eq!(receipt.task_id, "task-1");
         assert_eq!(receipt.channel, Channel::Qq as i32);
         assert_eq!(receipt.target_id, "openid_test");
@@ -839,5 +841,67 @@ mod tests {
 
         cancel.cancel();
         loop_task.await.unwrap().unwrap();
+    }
+
+    /// 轮询 `XINFO GROUPS` 直到 group 出现（consume_loop 建组完成信号）。
+    async fn wait_for_group(conn: &mut MultiplexedConnection, stream: &str, group: &str) {
+        use std::time::Instant;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // XINFO GROUPS 每组是 name/consumers/pending/... 的扁平数组，值为
+            // 字符串与整数混合：按 Value 解析后只找 name 字段。
+            let groups: Vec<Vec<redis::Value>> = redis::cmd("XINFO")
+                .arg("GROUPS")
+                .arg(stream)
+                .query_async(conn)
+                .await
+                .unwrap_or_default();
+            let found = groups.iter().any(|fields| {
+                fields.chunks(2).any(|pair| {
+                    matches!(
+                        (pair.first(), pair.get(1)),
+                        (
+                            Some(redis::Value::BulkString(key)),
+                            Some(redis::Value::BulkString(value))
+                        ) if key.as_slice() == b"name" && value.as_slice() == group.as_bytes()
+                    )
+                })
+            });
+            if found {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "consumer group {group} not created in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 轮询 XRANGE receipts stream 直到出现 task_id 匹配的 receipt。
+    async fn wait_for_receipt(
+        conn: &mut MultiplexedConnection,
+        stream: &str,
+        timeout: Duration,
+    ) -> SendReceipt {
+        use redis::AsyncCommands;
+        use std::time::Instant;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let reply: redis::streams::StreamRangeReply = conn.xrange_all(stream).await.unwrap();
+            for entry in &reply.ids {
+                if let Some(redis::Value::BulkString(bytes)) = entry.map.get("data")
+                    && let Ok(receipt) = SendReceipt::decode(bytes.as_slice())
+                    && receipt.task_id == "task-1"
+                {
+                    return receipt;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "receipt not published in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

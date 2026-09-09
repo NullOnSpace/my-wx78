@@ -20,7 +20,7 @@ Redis相关配置应提供默认值
 Redis中订阅的频道:
 
 - `REDIS_SOURCE_CHANNELS`: 订阅的频道列表，多个频道用逗号分隔，例如: `qqbot,qqbot2`
-- `REDIS_RETWEET_CHANNEL`: 转发的频道，例如: `qqbot_retweet`
+- `REDIS_MSGS_STREAM`: 入向 canonical CHAT 的 XADD 目标 stream，例如: `stream:msgs:in`
 
 ## 功能
 
@@ -32,6 +32,6 @@ Redis中订阅的频道:
 
 ### 转发消息
 
-- 一个监听QQ机器人接收的消息，转发到`REDIS_RETWEET_CHANNEL`。
+- 一个监听QQ机器人接收的消息，构造 canonical CHAT 后发布到`REDIS_MSGS_STREAM`。
 
 
